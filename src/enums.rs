@@ -12,6 +12,9 @@ pub enum Signal {
     CtrlC, // Interrupt current editing
     /// Abort with `Ctrl+D` signalling `EOF` or abort of a whole interactive session
     CtrlD, // End terminal session
+    /// Execute command with host (for PTY/TUI commands)
+    #[cfg(feature = "substrate_host_hook")]
+    ExecuteHostCommand(String),
 }
 
 /// Editing actions which can be mapped to key bindings.

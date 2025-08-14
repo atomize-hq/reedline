@@ -170,6 +170,9 @@ pub struct Reedline {
 
     #[cfg(feature = "external_printer")]
     external_printer: Option<ExternalPrinter<String>>,
+    
+    #[cfg(feature = "substrate_host_hook")]
+    host_decider: Option<std::sync::Arc<dyn crate::HostCommandDecider>>,
 }
 
 struct BufferEditor {
@@ -244,6 +247,8 @@ impl Reedline {
             immediately_accept: false,
             #[cfg(feature = "external_printer")]
             external_printer: None,
+            #[cfg(feature = "substrate_host_hook")]
+            host_decider: None,
         }
     }
 
@@ -623,6 +628,30 @@ impl Reedline {
         self.history.sync()
     }
 
+    #[cfg(feature = "substrate_api")]
+    /// Mark editor as suspended or not. When true, the next `read_line` is a "resume".
+    pub fn set_suspended(&mut self, suspended: bool) {
+        if suspended {
+            self.suspended_state = Some(self.painter.state_before_suspension());
+        } else {
+            self.suspended_state = None;
+        }
+    }
+
+    #[cfg(feature = "substrate_api")]
+    /// Force an immediate repaint right now.
+    pub fn repaint_now(&mut self, prompt: &dyn Prompt) -> Result<()> {
+        // Call the same internal render path used when resuming from suspend
+        self.repaint(prompt)?;
+        Ok(())
+    }
+    
+    #[cfg(feature = "substrate_host_hook")]
+    /// Set the host command decider for determining when to use ExecuteHostCommand
+    pub fn set_host_decider(&mut self, decider: std::sync::Arc<dyn crate::HostCommandDecider>) {
+        self.host_decider = Some(decider);
+    }
+
     /// Check if any commands have been run.
     ///
     /// When no commands have been run, calling [`Self::update_last_command_context`]
@@ -698,16 +727,18 @@ impl Reedline {
     /// Helper implementing the logic for [`Reedline::read_line()`] to be wrapped
     /// in a `raw_mode` context.
     fn read_line_helper(&mut self, prompt: &dyn Prompt) -> Result<Signal> {
-        self.painter
-            .initialize_prompt_position(self.suspended_state.as_ref())?;
+        // Only initialize and repaint if not already done in read_line
         if self.suspended_state.is_some() {
-            // Last editor was suspended to run a ExecuteHostCommand event,
-            // we are resuming operation now.
+            self.painter
+                .initialize_prompt_position(self.suspended_state.as_ref())?;
             self.suspended_state = None;
+            self.hide_hints = false;
+            self.repaint(prompt)?;
+        } else {
+            self.painter.initialize_prompt_position(None)?;
+            self.hide_hints = false;
+            self.repaint(prompt)?;
         }
-        self.hide_hints = false;
-
-        self.repaint(prompt)?;
 
         loop {
             #[cfg(feature = "external_printer")]
@@ -1908,6 +1939,20 @@ impl Reedline {
         }
         self.run_edit_commands(&[EditCommand::Clear]);
         self.editor.reset_undo_stack();
+
+        #[cfg(feature = "substrate_host_hook")]
+        if let Some(ref decider) = self.host_decider {
+            match decider.decide(&buffer) {
+                crate::ExecDecision::ExecuteHostCommand(cmd) => {
+                    // Mark suspended so the next read_line becomes a resume
+                    self.suspended_state = Some(self.painter.state_before_suspension());
+                    return Ok(EventStatus::Exits(Signal::ExecuteHostCommand(cmd)));
+                }
+                crate::ExecDecision::Success(line) => {
+                    return Ok(EventStatus::Exits(Signal::Success(line)));
+                }
+            }
+        }
 
         Ok(EventStatus::Exits(Signal::Success(buffer)))
     }

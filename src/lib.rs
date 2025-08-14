@@ -287,6 +287,11 @@ pub use terminal_extensions::kitty_protocol_available;
 mod utils;
 
 mod external_printer;
+
+#[cfg(feature = "substrate_host_hook")]
+mod host_hook;
+#[cfg(feature = "substrate_host_hook")]
+pub use host_hook::{ExecDecision, HostCommandDecider};
 pub use utils::{
     get_reedline_default_keybindings, get_reedline_edit_commands,
     get_reedline_keybinding_modifiers, get_reedline_keycodes, get_reedline_prompt_edit_modes,

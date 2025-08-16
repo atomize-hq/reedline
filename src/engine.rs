@@ -177,6 +177,18 @@ struct BufferEditor {
     temp_file: PathBuf,
 }
 
+/// Guard that automatically resumes Reedline when dropped
+pub struct SuspendGuard<'a> {
+    editor: &'a mut Reedline,
+}
+
+impl<'a> Drop for SuspendGuard<'a> {
+    fn drop(&mut self) {
+        // Clear suspended state on drop
+        self.editor.suspended_state = None;
+    }
+}
+
 impl Drop for Reedline {
     fn drop(&mut self) {
         if self.cursor_shapes.is_some() {
@@ -646,6 +658,34 @@ impl Reedline {
                 "No command run",
             ))),
         }
+    }
+
+    /// Suspend Reedline for external command execution (e.g., PTY commands)
+    /// 
+    /// Returns a guard that automatically resumes when dropped.
+    /// This is useful when running commands that take over the terminal
+    /// like vim, ssh, or other TUI applications.
+    /// 
+    /// # Example
+    /// ```no_run
+    /// let mut rl = Reedline::create();
+    /// {
+    ///     let _guard = rl.suspend_guard();
+    ///     // Run PTY command here
+    ///     // Guard automatically resumes on drop
+    /// }
+    /// ```
+    pub fn suspend_guard(&mut self) -> SuspendGuard<'_> {
+        // Save current painter state before suspension
+        self.suspended_state = Some(self.painter.state_before_suspension());
+        SuspendGuard { editor: self }
+    }
+    
+    /// Force an immediate repaint of the prompt
+    /// 
+    /// Useful after terminal state changes or when resuming from suspension.
+    pub fn force_repaint(&mut self, prompt: &dyn Prompt) -> std::io::Result<()> {
+        self.repaint(prompt)
     }
 
     /// Wait for input and provide the user with a specified [`Prompt`].

@@ -239,7 +239,7 @@ mod painting;
 pub use painting::{Painter, StyledText};
 
 mod engine;
-pub use engine::Reedline;
+pub use engine::{Reedline, SuspendGuard};
 
 mod result;
 pub use result::{ReedlineError, ReedlineErrorVariants, Result};

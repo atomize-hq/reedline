@@ -177,6 +177,18 @@ struct BufferEditor {
     temp_file: PathBuf,
 }
 
+/// Guard that automatically resumes Reedline when dropped
+pub struct SuspendGuard<'a> {
+    editor: &'a mut Reedline,
+}
+
+impl<'a> Drop for SuspendGuard<'a> {
+    fn drop(&mut self) {
+        // Clear suspended state on drop
+        self.editor.suspended_state = None;
+    }
+}
+
 impl Drop for Reedline {
     fn drop(&mut self) {
         if self.cursor_shapes.is_some() {
@@ -673,6 +685,122 @@ impl Reedline {
     /// Returns the current contents of the input buffer.
     pub fn current_buffer_contents(&self) -> &str {
         self.editor.get_buffer()
+    }
+
+    /// Suspend Reedline for external command execution (e.g., PTY commands)
+    ///
+    /// Returns a guard that automatically resumes when dropped.
+    /// This is useful when running commands that take over the terminal
+    /// like vim, ssh, or other TUI applications.
+    pub fn suspend_guard(&mut self) -> SuspendGuard<'_> {
+        // Save current painter state before suspension
+        self.suspended_state = Some(self.painter.state_before_suspension());
+        SuspendGuard { editor: self }
+    }
+
+    /// Force an immediate repaint of the prompt.
+    ///
+    /// Useful after terminal state changes or when resuming from suspension.
+    pub fn force_repaint(&mut self, prompt: &dyn Prompt) -> std::io::Result<()> {
+        self.repaint(prompt)
+    }
+
+    /// Prepare the editor for non-blocking usage by initializing terminal state
+    /// and rendering the current prompt.
+    pub fn begin_nonblocking_session(&mut self, prompt: &dyn Prompt) -> Result<()> {
+        self.bracketed_paste.enter();
+        self.kitty_protocol.enter();
+        self.painter
+            .initialize_prompt_position(self.suspended_state.as_ref())?;
+        if self.suspended_state.is_some() {
+            self.suspended_state = None;
+        }
+        self.hide_hints = false;
+        self.repaint(prompt)?;
+        Ok(())
+    }
+
+    /// Restore terminal state after a non-blocking session.
+    pub fn end_nonblocking_session(&mut self) {
+        self.bracketed_paste.exit();
+        self.kitty_protocol.exit();
+    }
+
+    /// Drain any pending messages from the external printer, repainting the prompt if needed.
+    /// Returns `true` when messages were rendered.
+    pub fn flush_external_messages(&mut self, prompt: &dyn Prompt) -> Result<bool> {
+        let mut printed = false;
+
+        #[cfg(feature = "external_printer")]
+        if let Some(ref external_printer) = self.external_printer {
+            let messages = Self::external_messages(external_printer)?;
+            if !messages.is_empty() {
+                self.painter
+                    .print_external_message(messages, self.editor.line_buffer(), prompt)?;
+                self.repaint(prompt)?;
+                printed = true;
+            }
+        }
+
+        Ok(printed)
+    }
+
+    /// Process a batch of collected terminal events without blocking on additional input.
+    pub fn process_events(
+        &mut self,
+        prompt: &dyn Prompt,
+        events: Vec<Event>,
+    ) -> Result<Option<Signal>> {
+        let _ = self.flush_external_messages(prompt)?;
+
+        let mut reedline_events: Vec<ReedlineEvent> = vec![];
+        let mut edits = vec![];
+        let mut resize = None;
+
+        for event in events {
+            if let Ok(event) = ReedlineRawEvent::try_from(event) {
+                match self.edit_mode.parse_event(event) {
+                    ReedlineEvent::Edit(edit) => edits.extend(edit),
+                    ReedlineEvent::Resize(x, y) => resize = Some((x, y)),
+                    event => {
+                        if !edits.is_empty() {
+                            reedline_events.push(ReedlineEvent::Edit(std::mem::take(&mut edits)));
+                        }
+                        reedline_events.push(event);
+                    }
+                }
+            }
+        }
+
+        if !edits.is_empty() {
+            reedline_events.push(ReedlineEvent::Edit(edits));
+        }
+        if let Some((x, y)) = resize {
+            reedline_events.push(ReedlineEvent::Resize(x, y));
+        }
+        if self.immediately_accept {
+            reedline_events.push(ReedlineEvent::Submit);
+        }
+
+        let mut need_repaint = false;
+        for event in reedline_events {
+            match self.handle_event(prompt, event)? {
+                EventStatus::Exits(signal) => {
+                    if self.suspended_state.is_none() {
+                        self.painter.move_cursor_to_end()?;
+                    }
+                    return Ok(Some(signal));
+                }
+                EventStatus::Handled => need_repaint = true,
+                EventStatus::Inapplicable => {}
+            }
+        }
+
+        if need_repaint {
+            self.repaint(prompt)?;
+        }
+
+        Ok(None)
     }
 
     /// Writes `msg` to the terminal with a following carriage return and newline

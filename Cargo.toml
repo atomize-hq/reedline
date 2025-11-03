@@ -60,3 +60,6 @@ required-features = ["external_printer"]
 # Whether to pass `--all-features` to Cargo (default: false)
 all-features = false
 features = ["bashisms", "external_printer", "sqlite"]
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

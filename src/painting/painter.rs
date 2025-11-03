@@ -16,6 +16,8 @@ use {
     std::io::{Result, Write},
     std::ops::RangeInclusive,
 };
+#[cfg(unix)]
+use std::time::Duration;
 #[cfg(feature = "external_printer")]
 use {crate::LineBuffer, crossterm::cursor::MoveUp};
 
@@ -59,6 +61,101 @@ pub struct PainterSuspendedState {
 enum PromptRowSelector {
     UseExistingPrompt { start_row: u16 },
     MakeNewPrompt { new_row: u16 },
+}
+
+fn current_cursor_position() -> Option<(u16, u16)> {
+    #[cfg(unix)]
+    {
+        if let Ok(pos) = fast_cursor_position(Duration::from_millis(60)) {
+            return Some(pos);
+        }
+    }
+
+    cursor::position().ok()
+}
+
+#[cfg(unix)]
+fn fast_cursor_position(timeout: Duration) -> Result<(u16, u16)> {
+    use libc::{poll, pollfd, read, POLLIN};
+    use std::io;
+    use std::os::unix::io::AsRawFd;
+    use std::time::Instant;
+
+    let stdin = io::stdin();
+    let fd = stdin.as_raw_fd();
+    let mut stdout = io::stdout();
+    stdout.write_all(b"\x1B[6n")?;
+    stdout.flush()?;
+
+    let mut buf = Vec::with_capacity(32);
+    buf.resize(32, 0);
+
+    let start = Instant::now();
+    loop {
+        let elapsed = start.elapsed();
+        if elapsed >= timeout {
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "cursor position timeout"));
+        }
+
+        let remaining = timeout - elapsed;
+        let mut pfd = pollfd {
+            fd,
+            events: POLLIN,
+            revents: 0,
+        };
+        let wait_ms = remaining.as_millis().min(i32::MAX as u128) as i32;
+        let ready = unsafe { poll(&mut pfd, 1, wait_ms) };
+        if ready == -1 {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err);
+        }
+
+        if ready == 0 {
+            continue;
+        }
+
+        if pfd.revents & POLLIN != 0 {
+            let read_bytes = unsafe { read(fd, buf.as_mut_ptr() as *mut _, buf.len()) };
+            if read_bytes <= 0 {
+                continue;
+            }
+            if let Some((row, col)) = parse_cursor_report(&buf[..read_bytes as usize]) {
+                return Ok((col, row));
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn parse_cursor_report(bytes: &[u8]) -> Option<(u16, u16)> {
+    if bytes.len() < 4 || bytes[0] != 0x1B || bytes[1] != b'[' {
+        return None;
+    }
+
+    let body = &bytes[2..];
+    let mut iter = body.split(|b| *b == b';');
+    let row_part = iter.next()?;
+    let col_part = iter.next()?;
+    if col_part.is_empty() {
+        return None;
+    }
+    let col_end = if col_part[col_part.len() - 1] == b'R' {
+        col_part.len() - 1
+    } else {
+        return None;
+    };
+
+    let row = std::str::from_utf8(row_part).ok()?.parse::<u16>().ok()?.saturating_sub(1);
+    let col = std::str::from_utf8(&col_part[..col_end])
+        .ok()?
+        .parse::<u16>()
+        .ok()?
+        .saturating_sub(1);
+
+    Some((row, col))
 }
 
 // Selects the row where the next prompt should start on, taking into account and whether it should re-use a previous
@@ -171,7 +268,9 @@ impl Painter {
                 size
             }
         };
-        let prompt_selector = select_prompt_row(suspended_state, cursor::position()?);
+        let fallback_row = self.screen_height().saturating_sub(1);
+        let cursor_position = current_cursor_position().unwrap_or((0, fallback_row));
+        let prompt_selector = select_prompt_row(suspended_state, cursor_position);
         self.prompt_start_row = match prompt_selector {
             PromptRowSelector::UseExistingPrompt { start_row } => start_row,
             PromptRowSelector::MakeNewPrompt { new_row } => {

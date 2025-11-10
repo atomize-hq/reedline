@@ -63,14 +63,22 @@ enum PromptRowSelector {
     MakeNewPrompt { new_row: u16 },
 }
 
+#[cfg(unix)]
 fn current_cursor_position() -> Option<(u16, u16)> {
-    #[cfg(unix)]
-    {
-        if let Ok(pos) = fast_cursor_position(Duration::from_millis(60)) {
-            return Some(pos);
-        }
+    if let Ok(pos) = fast_cursor_position(Duration::from_millis(60)) {
+        return Some(pos);
     }
+    // Some terminals may delay the cursor position report while resuming from a PTY handoff.
+    // Retry once with a longer timeout rather than falling back to the blocking
+    // `cursor::position()` call, which can hang the prompt until the user presses a key.
+    if let Ok(pos) = fast_cursor_position(Duration::from_millis(250)) {
+        return Some(pos);
+    }
+    None
+}
 
+#[cfg(not(unix))]
+fn current_cursor_position() -> Option<(u16, u16)> {
     cursor::position().ok()
 }
 
@@ -351,12 +359,12 @@ impl Painter {
         self.large_buffer = required_lines >= screen_height;
 
         // This might not be terribly performant. Testing it out
-        let is_reset = || match cursor::position() {
+        let is_reset = || match current_cursor_position() {
             // when output something without newline, the cursor position is at current line.
             // but the prompt_start_row is next line.
             // in this case we don't want to reset, need to `add 1` to handle for such case.
-            Ok(position) => position.1 + 1 < self.prompt_start_row,
-            Err(_) => false,
+            Some(position) => position.1 + 1 < self.prompt_start_row,
+            None => false,
         };
 
         // Moving the start position of the cursor based on the size of the required lines
@@ -624,18 +632,16 @@ impl Painter {
     pub(crate) fn handle_resize(&mut self, width: u16, height: u16) {
         self.terminal_size = (width, height);
 
-        // `cursor::position() is blocking and can timeout.
-        // The question is whether we can afford it. If not, perhaps we should use it in some scenarios but not others
-        // The problem is trying to calculate this internally doesn't seem to be reliable because terminals might
-        // have additional text in their buffer that messes with the offset on scroll.
-        // It seems like it _should_ be ok because it only happens on resize.
+        // Fetching cursor position can block on certain terminals, so `current_cursor_position`
+        // caps the wait with a timeout on Unix. On other platforms we still rely on
+        // `cursor::position()`.
 
         // Known bug: on iterm2 and kitty, clearing the screen via CMD-K doesn't reset
         // the position. Might need to special-case this.
         //
         // I assume this is a bug with the position() call but haven't figured that
         // out yet.
-        if let Ok(position) = cursor::position() {
+        if let Some(position) = current_cursor_position() {
             self.prompt_start_row = position.1;
             self.just_resized = true;
         }

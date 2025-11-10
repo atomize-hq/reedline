@@ -76,7 +76,7 @@ fn current_cursor_position() -> Option<(u16, u16)> {
 
 #[cfg(unix)]
 fn fast_cursor_position(timeout: Duration) -> Result<(u16, u16)> {
-    use libc::{poll, pollfd, read, POLLIN};
+    use libc::{fcntl, poll, pollfd, read, F_GETFL, F_SETFL, O_NONBLOCK, POLLIN};
     use std::io;
     use std::os::unix::io::AsRawFd;
     use std::time::Instant;
@@ -87,6 +87,20 @@ fn fast_cursor_position(timeout: Duration) -> Result<(u16, u16)> {
     stdout.write_all(b"\x1B[6n")?;
     stdout.flush()?;
 
+    unsafe {
+        let original = fcntl(fd, F_GETFL);
+        if original != -1 && fcntl(fd, F_SETFL, original | O_NONBLOCK) != -1 {
+            let mut buf = [0u8; 256];
+            loop {
+                let read_bytes = read(fd, buf.as_mut_ptr() as *mut _, buf.len());
+                if read_bytes <= 0 {
+                    break;
+                }
+            }
+            let _ = fcntl(fd, F_SETFL, original);
+        }
+    }
+
     let mut buf = Vec::with_capacity(32);
     buf.resize(32, 0);
 
@@ -94,7 +108,7 @@ fn fast_cursor_position(timeout: Duration) -> Result<(u16, u16)> {
     loop {
         let elapsed = start.elapsed();
         if elapsed >= timeout {
-            return Err(io::Error::new(io::ErrorKind::TimedOut, "cursor position timeout"));
+            break;
         }
 
         let remaining = timeout - elapsed;
@@ -127,6 +141,11 @@ fn fast_cursor_position(timeout: Duration) -> Result<(u16, u16)> {
             }
         }
     }
+
+    Err(io::Error::new(
+        io::ErrorKind::TimedOut,
+        "cursor position timeout",
+    ))
 }
 
 #[cfg(unix)]

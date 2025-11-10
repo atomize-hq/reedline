@@ -184,8 +184,6 @@ pub struct SuspendGuard<'a> {
 
 impl<'a> Drop for SuspendGuard<'a> {
     fn drop(&mut self) {
-        // Clear suspended state on drop
-        self.editor.suspended_state = None;
     }
 }
 
